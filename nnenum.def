@@ -1,0 +1,35 @@
+Bootstrap: docker
+From: python:3.10
+
+%files
+    ./requirements.txt /work/requirements.txt
+    . /work
+
+%post
+    # Set working directory
+    cd /work
+    
+    # Install python package dependencies
+    pip3 install -r requirements.txt
+    
+    # Set environment variables in the container
+    echo 'export PYTHONPATH=$PYTHONPATH:/work/src' >> $SINGULARITY_ENVIRONMENT
+    echo 'export OPENBLAS_NUM_THREADS=1' >> $SINGULARITY_ENVIRONMENT
+    echo 'export OMP_NUM_THREADS=1' >> $SINGULARITY_ENVIRONMENT
+
+%runscript
+    cd /work
+    exec ./run_tests.sh "$@"
+
+%labels
+    Author nnenum developers
+    Description Container for nnenum neural network verification tool
+
+%help
+    This container provides the nnenum neural network verification tool.
+    
+    To run the tests:
+    apptainer run nnenum_verification.sif
+    
+    To get a shell:
+    apptainer shell nnenum_verification.sif
