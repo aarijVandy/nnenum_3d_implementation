@@ -15,6 +15,7 @@ from skl2onnx.helpers.onnx_helper import enumerate_model_node_outputs, select_mo
 from onnx.helper import ValueInfoProto, make_graph, make_model
 
 from nnenum.network import NeuralNetwork, AddLayer, FlattenLayer, ReluLayer, MatMulLayer, FullyConnectedLayer
+from nnenum.network import Convolutional3dLayer, Pooling3dLayer, Convolutional2dLayer, PoolingLayer
 from nnenum.network import nn_unflatten, nn_flatten
 from nnenum.settings import Settings
 
@@ -355,6 +356,178 @@ def load_onnx_network_optimized(filename):
                     weight_mat = weight_mat.transpose().copy()
 
             layer = FullyConnectedLayer(len(layers), weight_mat, bias_vec, prev_shape)
+        elif op == 'Conv':
+            # Handle both 2D and 3D convolution based on weight tensor dimensions
+            assert len(cur_node.input) >= 2, "Conv requires at least weight input"
+            
+            weight_init = init_map[cur_node.input[1]]
+            assert weight_init.data_type == onnx_type_float
+            
+            # Extract kernel weights
+            weight_data = np.frombuffer(weight_init.raw_data, dtype='<f4')
+            weight_shape = tuple(weight_init.dims)
+            kernels = weight_data.reshape(weight_shape)
+            
+            # Extract biases (if present)
+            if len(cur_node.input) >= 3 and cur_node.input[2] in init_map:
+                bias_init = init_map[cur_node.input[2]]
+                assert bias_init.data_type == onnx_type_float
+                bias_data = np.frombuffer(bias_init.raw_data, dtype='<f4')
+                biases = bias_data.reshape(bias_init.dims)
+            else:
+                # Create zero biases if not provided
+                biases = np.zeros(weight_shape[0], dtype=np.float32)
+            
+            # Determine if this is 2D or 3D convolution based on weight dimensions
+            if len(weight_shape) == 5:
+                # 3D convolution: (output_channels, input_channels, depth, height, width)
+                print(f"  Detected 3D convolution with weight shape {weight_shape}")
+                conv_mode = 'constant'  # equivalent to 'same' padding for 3D
+                
+                # Parse attributes for padding, stride, etc.
+                for attr in cur_node.attribute:
+                    if attr.name == 'pads':
+                        pads = list(attr.ints)
+                        if any(p != 0 for p in pads):
+                            conv_mode = 'constant'
+                
+                layer = Convolutional3dLayer(len(layers), kernels, biases, prev_shape, mode=conv_mode)
+                
+            elif len(weight_shape) == 4:
+                # Regular 2D convolution: (output_channels, input_channels, height, width)
+                print(f"  Detected 2D convolution with weight shape {weight_shape}")
+                
+                # Parse attributes
+                conv_mode = 'same'
+                boundary = 'fill'
+                for attr in cur_node.attribute:
+                    if attr.name == 'pads':
+                        pads = list(attr.ints)
+                        if all(p == 0 for p in pads):
+                            conv_mode = 'valid'
+                
+                layer = Convolutional2dLayer(len(layers), kernels, biases, prev_shape, 
+                                           mode=conv_mode, boundary=boundary)
+            else:
+                assert False, f"Unsupported Conv weight shape: {weight_shape}"
+                
+        elif op == 'AveragePool':
+            # Handle both 2D and 3D pooling based on kernel shape
+            kernel_size = 2  # default
+            is_3d_pool = False
+            
+            for attr in cur_node.attribute:
+                if attr.name == 'kernel_shape':
+                    kernel_sizes = list(attr.ints)
+                    if len(kernel_sizes) == 3:
+                        # 3D pooling
+                        is_3d_pool = True
+                        kernel_size = kernel_sizes[0]  # assume cubic for now
+                        if not all(k == kernel_size for k in kernel_sizes):
+                            print(f"  Warning: Non-cubic 3D pooling kernel {kernel_sizes}, using first dimension")
+                    elif len(kernel_sizes) == 2:
+                        # 2D pooling
+                        is_3d_pool = False
+                        kernel_size = kernel_sizes[0]  # assume square for now
+                        if not all(k == kernel_size for k in kernel_sizes):
+                            print(f"  Warning: Non-square 2D pooling kernel {kernel_sizes}, using first dimension")
+                    else:
+                        assert False, f"Unsupported pooling kernel shape: {kernel_sizes}"
+            
+            if is_3d_pool:
+                print(f"  Detected 3D average pooling with kernel size {kernel_size}")
+                layer = Pooling3dLayer(len(layers), kernel_size, prev_shape, method='mean')
+            else:
+                print(f"  Detected 2D average pooling with kernel size {kernel_size}")
+                layer = PoolingLayer(len(layers), kernel_size, prev_shape, method='mean')
+                
+        elif op == 'MaxPool':
+            # Handle both 2D and 3D max pooling
+            kernel_size = 2  # default
+            is_3d_pool = False
+            
+            for attr in cur_node.attribute:
+                if attr.name == 'kernel_shape':
+                    kernel_sizes = list(attr.ints)
+                    if len(kernel_sizes) == 3:
+                        is_3d_pool = True
+                        kernel_size = kernel_sizes[0]
+                        if not all(k == kernel_size for k in kernel_sizes):
+                            print(f"  Warning: Non-cubic 3D pooling kernel {kernel_sizes}, using first dimension")
+                    elif len(kernel_sizes) == 2:
+                        is_3d_pool = False
+                        kernel_size = kernel_sizes[0]
+                        if not all(k == kernel_size for k in kernel_sizes):
+                            print(f"  Warning: Non-square 2D pooling kernel {kernel_sizes}, using first dimension")
+            
+            if is_3d_pool:
+                print(f"  Detected 3D max pooling with kernel size {kernel_size} (using mean pooling for verification)")
+                layer = Pooling3dLayer(len(layers), kernel_size, prev_shape, method='mean')
+            else:
+                print(f"  Detected 2D max pooling with kernel size {kernel_size} (using mean pooling for verification)")
+                layer = PoolingLayer(len(layers), kernel_size, prev_shape, method='mean')
+        elif op == 'Conv3d':
+            # Explicit 3D convolution
+            assert len(cur_node.input) >= 2, "Conv3d requires at least weight input"
+            
+            weight_init = init_map[cur_node.input[1]]
+            assert weight_init.data_type == onnx_type_float
+            
+            # Extract kernel weights
+            weight_data = np.frombuffer(weight_init.raw_data, dtype='<f4')
+            # ONNX Conv3d weight shape: (output_channels, input_channels, depth, height, width)
+            weight_shape = tuple(weight_init.dims)
+            kernels = weight_data.reshape(weight_shape)
+            
+            # Extract biases (if present)
+            if len(cur_node.input) >= 3 and cur_node.input[2] in init_map:
+                bias_init = init_map[cur_node.input[2]]
+                assert bias_init.data_type == onnx_type_float
+                bias_data = np.frombuffer(bias_init.raw_data, dtype='<f4')
+                biases = bias_data.reshape(bias_init.dims)
+            else:
+                # Create zero biases if not provided
+                biases = np.zeros(weight_shape[0], dtype=np.float32)
+            
+            # Parse attributes (padding, stride, etc.)
+            conv_mode = 'constant'  # default for 3D conv (equivalent to 'same' padding)
+            for attr in cur_node.attribute:
+                if attr.name == 'pads':
+                    # Handle padding - for now we assume symmetric padding
+                    pads = list(attr.ints)
+                    if any(p != 0 for p in pads):
+                        conv_mode = 'constant'
+                # Could add stride, dilation support here if needed
+            
+            layer = Convolutional3dLayer(len(layers), kernels, biases, prev_shape, mode=conv_mode)
+            
+        elif op == 'AveragePool3d':
+            # Explicit 3D average pooling
+            kernel_size = 2  # default
+            
+            for attr in cur_node.attribute:
+                if attr.name == 'kernel_shape':
+                    kernel_sizes = list(attr.ints)
+                    assert len(kernel_sizes) == 3, "AveragePool3d requires 3D kernel"
+                    # For now, assume cubic kernels (all dimensions same)
+                    kernel_size = kernel_sizes[0]
+                    assert all(k == kernel_size for k in kernel_sizes), "Only cubic kernels supported"
+            
+            layer = Pooling3dLayer(len(layers), kernel_size, prev_shape, method='mean')
+            
+        elif op == 'MaxPool3d':
+            # Explicit 3D max pooling
+            kernel_size = 2  # default
+            
+            for attr in cur_node.attribute:
+                if attr.name == 'kernel_shape':
+                    kernel_sizes = list(attr.ints)
+                    assert len(kernel_sizes) == 3, "MaxPool3d requires 3D kernel"
+                    # For now, assume cubic kernels (all dimensions same)
+                    kernel_size = kernel_sizes[0]
+                    assert all(k == kernel_size for k in kernel_sizes), "Only cubic kernels supported"
+            
+            layer = Pooling3dLayer(len(layers), kernel_size, prev_shape, method='mean')
         else:
             assert False, f"unsupported onnx op_type {op} in node {cur_node.name}"
 

@@ -7,6 +7,11 @@ Network container classes for nnenum
 import numpy as np
 import onnx
 from scipy.signal import convolve2d
+try:
+    from scipy.ndimage import convolve
+    HAS_SCIPY_NDIMAGE = True
+except ImportError:
+    HAS_SCIPY_NDIMAGE = False
 
 from nnenum.util import Freezable
 from nnenum.timerutil import Timers
@@ -661,10 +666,424 @@ class Convolutional2dLayer(Freezable):
 
         return output
 
-class PoolingLayer(Freezable):
-    '''a 2d max/mean pooling layer (multi channel)
+class Convolutional3dLayer(Freezable):
+    '''a 3d convolutional layer which takes in multi-channel 3d input data and
+    outputs multi-channel 3d data
     '''
 
+    def __init__(self, layer_num, kernels, biases, prev_layer_output_shape, mode='constant'):
+        self.layer_num = layer_num
+        self.biases = biases
+        self.mode = mode
+
+        assert isinstance(prev_layer_output_shape, tuple), f"prev_layer_shape was {prev_layer_output_shape}"
+        
+        self.prev_layer_output_shape = prev_layer_output_shape
+
+        self.network = None # assigned on network construction
+
+        self.kernels = [] # a list of lists of 3d kernels
+
+        assert len(prev_layer_output_shape) == 4, "previous layer should provide 4 channel output (depth, height, width, channels)"
+
+        assert len(kernels) >= 1, "need at least one kernel"
+        assert isinstance(biases, np.ndarray)
+        assert len(kernels.shape) == 5, "expected shape is 5: (# output channels, # input channels, d, h, w); " + \
+                                f"got: {kernels.shape}"
+
+        num_output_channels = kernels.shape[0]
+        assert biases.shape == (num_output_channels, ), "expected one bias per output channel, shape: " + \
+                                                        f"({num_output_channels}, ), got {biases.shape}"
+
+        # Store kernels directly (no flipping needed for scipy.ndimage.convolve)
+        for k in kernels:
+            channel_kernels = []
+            self.kernels.append(channel_kernels)
+            
+            for channel_kernel in k:
+                assert len(channel_kernel.shape) == 3, "expected a list of list of 3d kernels"
+                channel_kernels.append(channel_kernel)
+        
+        self.freeze_attrs()
+
+    def __str__(self):
+        return f'[Convolutional3dLayer with {self.get_input_shape()} input and {self.get_output_shape()} output]'
+
+    def get_input_shape(self):
+        'get the input shape to this layer'
+
+        return self.prev_layer_output_shape
+
+    def get_output_shape(self):
+        'get the output shape from this layer'
+
+        # prev_layer_output_shape: <depth, height, width, channels>
+
+        num_output_channels = len(self.kernels)
+        depth = self.prev_layer_output_shape[0]
+        height = self.prev_layer_output_shape[1]
+        width = self.prev_layer_output_shape[2]
+
+        if self.mode == 'valid':
+            # Reduce size based on kernel size
+            kernel_d, kernel_h, kernel_w = self.kernels[0][0].shape
+            depth -= kernel_d - 1
+            height -= kernel_h - 1
+            width -= kernel_w - 1
+
+        return (depth, height, width, num_output_channels)
+
+    def transform_star(self, star):
+        'apply the linear transformation part of the layer to the passed-in lp_star (not relu)'
+
+        shape = self.get_input_shape()
+
+        # a_mat has one generator PER COLUMN
+        result_columns = []
+
+        for cindex in range(star.a_mat.shape[1]):
+            column = star.a_mat[:, cindex]
+
+            multichannel_state = nn_unflatten(column, shape)
+            multichannel_state = self.execute(multichannel_state, zero_bias=True)
+            flat = nn_flatten(multichannel_state)
+            flat.shape = (flat.size, 1)
+            result_columns.append(flat)
+
+        star.a_mat = np.hstack(result_columns)
+
+        # bias (anchor) transformation includes layer bias
+        multichannel_state = nn_unflatten(star.bias, shape)
+        multichannel_state = self.execute(multichannel_state)
+        flat = nn_flatten(multichannel_state)
+        star.bias = flat
+
+        assert star.bias.size == star.a_mat.shape[0]
+
+    def transform_zono(self, zono):
+        'apply the linear transformation part of the layer to the passed-in zonotope (not relu)'
+
+        # mat_t has one generator PER COLUMN
+        shape = self.get_input_shape()
+
+        result_columns = []
+
+        for cindex in range(zono.mat_t.shape[1]):
+            column = zono.mat_t[:, cindex]
+
+            multichannel_state = nn_unflatten(column, shape)
+            multichannel_state = self.execute(multichannel_state, zero_bias=True)
+
+            flat = nn_flatten(multichannel_state)
+            flat.shape = (flat.size, 1)
+            result_columns.append(flat)
+            
+        zono.mat_t = np.hstack(result_columns)
+
+        # center transformation includes layer bias
+        multichannel_state = nn_unflatten(zono.center, shape)
+        multichannel_state = self.execute(multichannel_state)
+        flat = nn_flatten(multichannel_state)
+        zono.center = flat
+
+        assert zono.center.size == zono.mat_t.shape[0]
+
+    def execute(self, state, zero_bias=False):
+        '''execute the 3d convolutional layer on a concrete state
+
+        if zero_bias is True, use a zero bias instead of what's in the layer (used in computations)       
+ 
+        returns output
+        '''
+
+        if not HAS_SCIPY_NDIMAGE:
+            raise ImportError("scipy.ndimage is required for 3D convolution operations. Please install scipy.")
+
+        Timers.tic('execute Convolutional3dLayer')
+
+        assert state.shape == self.prev_layer_output_shape, f"expected shape {self.prev_layer_output_shape}, " + \
+                                                            f"got {state.shape}"
+
+        output = []
+        output_shape = self.get_output_shape()
+
+        for kernel, bias in zip(self.kernels, self.biases):
+            out = np.zeros(output_shape[:-1])  # depth, height, width
+
+            if not zero_bias:
+                out.fill(bias)
+
+            for i, channel_kernel in enumerate(kernel):
+                # Extract 3d channel from input (depth, height, width, channel)
+                state3d = state[:, :, :, i] 
+                Timers.tic('convolve3d')
+                
+                # Use scipy.ndimage.convolve for 3D convolution
+                if self.mode == 'constant':
+                    # equivalent to 'same' padding
+                    channel_out = convolve(state3d, channel_kernel, mode='constant', cval=0.0)
+                else:
+                    channel_out = convolve(state3d, channel_kernel, mode=self.mode)
+                
+                Timers.toc('convolve3d')
+
+                Timers.tic('add')
+                out += channel_out
+                Timers.toc('add')
+            
+            output.append(out)
+                
+        Timers.tic('output transpose')
+        output = np.array(output, dtype=float)
+        # convert to depth, height, width, channels
+        output = output.transpose((1, 2, 3, 0))
+        Timers.toc('output transpose')
+    
+        Timers.toc('execute Convolutional3dLayer')
+
+        return output
+
+class Pooling3dLayer(Freezable):
+    '''a 3d max/mean pooling layer (multi channel)
+    '''
+
+    def __init__(self, layer_num, kernel_size, prev_layer_output_shape, method='max'):
+        self.layer_num = layer_num
+        self.kernel_size = kernel_size
+        self.stride = kernel_size
+        self.prev_layer_output_shape = prev_layer_output_shape
+
+        self.network = None # assigned on network construction
+
+        assert method in ['max', 'mean'], f"unknown method: {method}"
+
+        self.method = method
+
+        self.freeze_attrs()
+
+    def __str__(self):
+        s = self.kernel_size
+        
+        return f'[Pooling3dLayer ({self.method}) {s}x{s}x{s} with stride {self.stride}, ' + \
+               f'input shape {self.get_input_shape()} and output shape {self.get_output_shape()}]'
+
+    def get_input_shape(self):
+        'get the input shape to this layer'
+
+        return self.prev_layer_output_shape
+
+    def get_output_shape(self):
+        'get the output shape from this layer'
+
+        s = self.kernel_size
+
+        depth = self.prev_layer_output_shape[0] // s
+        height = self.prev_layer_output_shape[1] // s
+        width = self.prev_layer_output_shape[2] // s
+
+        rv = [depth, height, width]
+
+        if len(self.prev_layer_output_shape) > 3:
+            rv += self.prev_layer_output_shape[3:]
+
+        return tuple(rv)
+
+    def transform_star(self, star):
+        'apply the 3d pooling transformation to the passed-in lp_star'
+
+        if self.method == 'mean':
+            # Mean pooling is linear - use same approach as convolutional layers
+            shape = self.get_input_shape()
+
+            # a_mat has one generator PER COLUMN
+            result_columns = []
+
+            for cindex in range(star.a_mat.shape[1]):
+                column = star.a_mat[:, cindex]
+
+                multichannel_state = nn_unflatten(column, shape)
+                multichannel_state = self.execute(multichannel_state)
+                flat = nn_flatten(multichannel_state)
+                flat.shape = (flat.size, 1)
+                result_columns.append(flat)
+
+            star.a_mat = np.hstack(result_columns)
+
+            # bias (anchor) transformation
+            multichannel_state = nn_unflatten(star.bias, shape)
+            multichannel_state = self.execute(multichannel_state)
+            flat = nn_flatten(multichannel_state)
+            star.bias = flat
+
+            assert star.bias.size == star.a_mat.shape[0]
+        else:
+            # Max pooling is not supported for verification
+            raise NotImplementedError(f"Star set propagation through 3D max pooling layers is not supported. "
+                                    f"Use mean pooling for verification.")
+
+    def transform_zono(self, zono):
+        'apply the 3d pooling transformation to the passed-in zonotope'
+
+        if self.method == 'mean':
+            # Mean pooling is linear - use same approach as convolutional layers
+            shape = self.get_input_shape()
+
+            result_columns = []
+
+            for cindex in range(zono.mat_t.shape[1]):
+                column = zono.mat_t[:, cindex]
+
+                multichannel_state = nn_unflatten(column, shape)
+                multichannel_state = self.execute(multichannel_state)
+
+                flat = nn_flatten(multichannel_state)
+                flat.shape = (flat.size, 1)
+                result_columns.append(flat)
+                
+            zono.mat_t = np.hstack(result_columns)
+
+            # center transformation
+            multichannel_state = nn_unflatten(zono.center, shape)
+            multichannel_state = self.execute(multichannel_state)
+            flat = nn_flatten(multichannel_state)
+            zono.center = flat
+
+            assert zono.center.size == zono.mat_t.shape[0]
+        else:
+            # Max pooling is not supported for verification
+            raise NotImplementedError(f"Zonotope propagation through 3D max pooling layers is not supported. "
+                                    f"Use mean pooling for verification.")
+
+    def execute(self, state, save_branching=False):
+        '''execute 3d pooling layer, potentially saving branching information
+
+        branching info will be an int for each output (if max pool), or possibly a LIST of ints (if two inputs match)
+        '''
+
+        Timers.tic('execute Pooling3dLayer')
+
+        ksize = self.kernel_size
+
+        assert len(state.shape) == 4, f"expected 4D input (depth, height, width, channels), got {state.shape}"
+        assert state.shape[0] % ksize == 0, f"depth {state.shape[0]} not divisible by kernel size {ksize}"
+        assert state.shape[1] % ksize == 0, f"height {state.shape[1]} not divisible by kernel size {ksize}"
+        assert state.shape[2] % ksize == 0, f"width {state.shape[2]} not divisible by kernel size {ksize}"
+
+        if save_branching:
+            rv = self._execute_with_branching(state)
+        else:
+            rv = self._execute_without_branching(state)
+
+        Timers.toc('execute Pooling3dLayer')
+
+        return rv
+
+    def _execute_without_branching(self, state):
+        'fast 3d max/mean pooling without storing branching information'
+        
+        ksize = self.kernel_size
+
+        nd = state.shape[0] // ksize
+        ny = state.shape[1] // ksize
+        nx = state.shape[2] // ksize
+        
+        new_shape = (nd, ksize, ny, ksize, nx, ksize) + state.shape[3:]
+
+        if self.method == 'max':
+            rv = np.nanmax(state.reshape(new_shape), axis=(1, 3, 5))
+        else:
+            assert self.method == 'mean'
+            rv = np.nanmean(state.reshape(new_shape), axis=(1, 3, 5))
+
+        return rv
+
+    def _execute_with_branching(self, state):
+        '''execute 3d pooling layer on a concrete state
+
+        branch_list will be an int for each output (if max pool), or possibly a LIST of ints (if two inputs match)
+
+        note: this will be significantly slower than without branching
+        '''
+
+        Timers.tic('execute_pooling3d_with_branching')
+
+        ksize = self.kernel_size 
+
+        depth = state.shape[0] // ksize
+        height = state.shape[1] // ksize
+        width = state.shape[2] // ksize
+        channels = state.shape[3]
+        
+        if self.method == 'max':
+            output = np.full((depth, height, width, channels), -np.inf, dtype=float)
+            branch_list = [None] * (channels * depth * height * width)
+        else:
+            output = np.zeros((depth, height, width, channels), dtype=float)
+            branch_list = []
+
+        for c in range(channels):
+            for d in range(state.shape[0]):
+                output_d = d // ksize
+                
+                for h in range(state.shape[1]):
+                    output_h = h // ksize
+                    
+                    for w in range(state.shape[2]):
+                        output_w = w // ksize
+                        
+                        val = state[d, h, w, c]
+
+                        if self.method == 'max':
+                            epsilon = 1e-9
+                            
+                            if val - epsilon > output[output_d, output_h, output_w, c]:
+                                # new max value
+                                output[output_d, output_h, output_w, c] = val
+
+                                # Calculate branching index for 3D
+                                d_in_block = d % ksize
+                                h_in_block = h % ksize
+                                w_in_block = w % ksize
+                                block_idx = (c * depth * height * width + 
+                                            output_d * height * width + 
+                                            output_h * width + output_w)
+                                mindex = d_in_block * ksize * ksize + h_in_block * ksize + w_in_block
+                                branch_list[block_idx] = mindex
+                                
+                            elif val + epsilon > output[output_d, output_h, output_w, c]:
+                                # two branches are both possible (within epsilon tolerance)
+                                output[output_d, output_h, output_w, c] = max(output[output_d, output_h, output_w, c], val)
+
+                                d_in_block = d % ksize
+                                h_in_block = h % ksize
+                                w_in_block = w % ksize
+                                block_idx = (c * depth * height * width + 
+                                            output_d * height * width + 
+                                            output_h * width + output_w)
+                                mindex = d_in_block * ksize * ksize + h_in_block * ksize + w_in_block
+
+                                if isinstance(branch_list[block_idx], int):
+                                    branch_list[block_idx] = [branch_list[block_idx], mindex]
+                                else:
+                                    branch_list[block_idx].append(mindex)
+                                    
+                        else:
+                            output[output_d, output_h, output_w, c] += val
+
+        if self.method == 'mean':
+            divider = self.kernel_size**3
+            output = output / divider
+            
+        rv = (output, branch_list)
+
+        Timers.toc('execute_pooling3d_with_branching')
+            
+        return rv
+
+class PoolingLayer(Freezable):  
+    '''a 2d max/mean pooling layer (multi channel)
+    '''
+    # based on the 2d pools. only implemented mean pooling for verification
     def __init__(self, layer_num, kernel_size, prev_layer_output_shape, method='max'):
         self.layer_num = layer_num
         self.kernel_size = kernel_size
@@ -704,6 +1123,72 @@ class PoolingLayer(Freezable):
             rv += self.prev_layer_output_shape[2:]
 
         return tuple(rv)
+
+    def transform_star(self, star):
+        'apply the pooling transformation to the passed-in lp_star'
+
+        if self.method == 'mean':
+            # Mean pooling is linear - use same approach as convolutional layers
+            shape = self.get_input_shape()
+
+            # a_mat has one generator PER COLUMN
+            result_columns = []
+
+            for cindex in range(star.a_mat.shape[1]):
+                column = star.a_mat[:, cindex]
+
+                multichannel_state = nn_unflatten(column, shape)
+                multichannel_state = self.execute(multichannel_state)
+                flat = nn_flatten(multichannel_state)
+                flat.shape = (flat.size, 1)
+                result_columns.append(flat)
+
+            star.a_mat = np.hstack(result_columns)
+
+            # bias (anchor) transformation
+            multichannel_state = nn_unflatten(star.bias, shape)
+            multichannel_state = self.execute(multichannel_state)
+            flat = nn_flatten(multichannel_state)
+            star.bias = flat
+
+            assert star.bias.size == star.a_mat.shape[0]
+        else:
+            # Max pooling is not supported for verification
+            raise NotImplementedError(f"Star set propagation through max pooling layers is not supported. "
+                                    f"Use mean pooling for verification.")
+
+    def transform_zono(self, zono):
+        'apply the pooling transformation to the passed-in zonotope'
+
+        if self.method == 'mean':
+            # Mean pooling is linear - use same approach as convolutional layers
+            shape = self.get_input_shape()
+
+            result_columns = []
+
+            for cindex in range(zono.mat_t.shape[1]):
+                column = zono.mat_t[:, cindex]
+
+                multichannel_state = nn_unflatten(column, shape)
+                multichannel_state = self.execute(multichannel_state)
+
+                flat = nn_flatten(multichannel_state)
+                flat.shape = (flat.size, 1)
+                result_columns.append(flat)
+                
+            zono.mat_t = np.hstack(result_columns)
+
+            # center transformation
+            multichannel_state = nn_unflatten(zono.center, shape)
+            multichannel_state = self.execute(multichannel_state)
+            flat = nn_flatten(multichannel_state)
+            zono.center = flat
+
+            assert zono.center.size == zono.mat_t.shape[0]
+        else:
+            # Max pooling is not supported for verification
+            raise NotImplementedError(f"Zonotope propagation through max pooling layers is not supported. "
+                                    f"Use mean pooling for verification.")
 
     def execute(self, state, save_branching=False):
         '''execute pooling layer, potentially saving branching informaton
@@ -854,7 +1339,7 @@ def nn_unflatten(image, shape, order='C'):
 def convert_weights(weights):
     'convert weights from a list format to an np.array format'
 
-    layers = [] # list of np.array for each layer
+    layers = []  # list of np.array for each layer
 
     for weight_mat in weights:
         layers.append(np.array(weight_mat, dtype=float))
@@ -868,7 +1353,7 @@ def convert_weights(weights):
 def convert_biases(biases):
     'convert biases from a list format to an np.array format'
 
-    layers = [] # list of np.array for each layer
+    layers = []  # list of np.array for each layer
 
     for biases_vec in biases:
         bias_ar = np.array(biases_vec, dtype=float)
